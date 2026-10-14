@@ -123,6 +123,7 @@ Work includes OV7670 capture debugging, edge-image preprocessing, YOLOv5n traini
 ## Author
 
 **Võ Hoàng Huy** & **Đặng Văn Thịnh** & **Phạm Trần Bảo Long**
+
 Electronics and Telecommunications student  
 GitHub: [@huyvo11122004](https://github.com/huyvo11122004)
 
