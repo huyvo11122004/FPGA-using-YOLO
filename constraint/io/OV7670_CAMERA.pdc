@@ -1,0 +1,42 @@
+# OV7670 camera I/O for MPFS Discovery Kit, MPFS095T-FCSG325.
+# These pins are in Bank1. The board constraint must set Bank1 VCCI=3.30 V,
+# and the physical J45 jumper must be in its 3.3 V position (pins 1-2).
+# REF_CLK_50MHz/R18 is in Bank0 and stays in BOARD_MISC as LVCMOS18.
+
+set_io -port_name {CAM_D[0]} \
+    -pin_name B20 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[1]} \
+    -pin_name D17 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[2]} \
+    -pin_name A19 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[3]} \
+    -pin_name F20 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[4]} \
+    -pin_name F19 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[5]} \
+    -pin_name F21 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[6]} \
+    -pin_name E21 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name {CAM_D[7]} \
+    -pin_name G18 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+
+set_io -port_name CAM_HREF \
+    -pin_name B21 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name CAM_PCLK \
+    -pin_name E12 -fixed true -io_std LVCMOS33 -DIRECTION INPUT
+set_io -port_name CAM_VSYNC \
+    -pin_name F18 -fixed true -io_std LVCMOS33 \
+    -USE_LANE_CALIB_CODE No -DIRECTION INPUT
+
+set_io -port_name CAM_PWDN \
+    -pin_name B15 -fixed true -io_std LVCMOS33 -DIRECTION OUTPUT
+set_io -port_name CAM_RESET_N \
+    -pin_name D18 -fixed true -io_std LVCMOS33 -DIRECTION OUTPUT
+set_io -port_name CAM_SIOC \
+    -pin_name E18 -fixed true -io_std LVCMOS33 -DIRECTION OUTPUT
+set_io -port_name CAM_SIOD \
+    -pin_name A20 -fixed true -io_std LVCMOS33 \
+    -CLAMP_DIODE OFF -RES_PULL None -DIRECTION INOUT
+set_io -port_name CAM_XCLK \
+    -pin_name E10 -fixed true -io_std LVCMOS33 -DIRECTION OUTPUT
+

@@ -1,0 +1,440 @@
+`timescale 1ns/1ps
+
+// Power-up and deterministic 640x480 RAW10 initialization for the official
+// Raspberry Pi Camera Module V2 (Sony IMX219, 7-bit I2C address 0x10).
+//
+// The register sequence follows the upstream Linux IMX219 driver:
+// common registers + two-lane PLL + centred 1280x960 crop with 2x2 analog
+// binning + 640x480 RAW10 output.  ENABLE_TEST_PATTERN=1 starts with colour
+// bars; change it to zero only after the MIPI link is proven.
+// LP11_FIX: after chip identification, stream briefly then return to standby
+// to force the power-up LP-11 transition used by the upstream Linux driver.
+// init_done additionally requires MODE_SELECT readback to equal streaming.
+module imx219_init_640x480 #(
+    parameter integer CLK_HZ = 54_347_826,
+    parameter integer I2C_HZ = 100_000,
+    parameter integer ENABLE_TEST_PATTERN = 1,
+    parameter integer LP11_DELAY_US = 200
+) (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       restart,
+
+    output reg        cam_enable,
+    output wire       cam_gpio1,
+    inout  wire       cam_scl,
+    inout  wire       cam_sda,
+
+    output reg        init_busy,
+    output reg        init_done,
+    output reg        init_error,
+    output reg [15:0] chip_id,
+    output reg [7:0]  debug_state,
+    output reg [7:0]  debug_index
+);
+
+    assign cam_gpio1 = 1'b0;
+
+    localparam integer OFF_CYCLES_RAW = CLK_HZ / 1000;  // 1 ms
+    localparam integer ON_CYCLES_RAW  = CLK_HZ / 50;    // 20 ms
+    localparam integer OFF_CYCLES = (OFF_CYCLES_RAW < 16) ? 16 : OFF_CYCLES_RAW;
+    localparam integer ON_CYCLES  = (ON_CYCLES_RAW  < 16) ? 16 : ON_CYCLES_RAW;
+    // Split multiplication to keep the constant calculation within 32 bits.
+    // Round up so that each LP-11 preparation delay is at least its request.
+    localparam integer LP11_CYCLES_RAW =
+        (CLK_HZ / 1000000) * LP11_DELAY_US +
+        (((CLK_HZ % 1000000) * LP11_DELAY_US + 999999) / 1000000);
+    localparam integer LP11_CYCLES =
+        (LP11_CYCLES_RAW < 1) ? 1 : LP11_CYCLES_RAW;
+    localparam integer MAX_DELAY_CYCLES =
+        (ON_CYCLES > LP11_CYCLES) ? ON_CYCLES : LP11_CYCLES;
+    localparam integer DELAY_W = $clog2(MAX_DELAY_CYCLES + 1);
+    localparam [7:0] ROM_LAST = 8'd67;
+
+    // Retain existing debug state values 0..9 for compatibility.
+    localparam [4:0]
+        ST_POWER_OFF          = 5'd0,
+        ST_POWER_ON           = 5'd1,
+        ST_ID0_ISSUE          = 5'd2,
+        ST_ID0_WAIT           = 5'd3,
+        ST_ID1_ISSUE          = 5'd4,
+        ST_ID1_WAIT           = 5'd5,
+        ST_WR_ISSUE           = 5'd6,
+        ST_WR_WAIT            = 5'd7,
+        ST_DONE               = 5'd8,
+        ST_ERROR              = 5'd9,
+        ST_LP11_STREAM_ISSUE  = 5'd10,
+        ST_LP11_STREAM_WAIT   = 5'd11,
+        ST_LP11_STREAM_HOLD   = 5'd12,
+        ST_LP11_STANDBY_ISSUE = 5'd13,
+        ST_LP11_STANDBY_WAIT  = 5'd14,
+        ST_LP11_STANDBY_HOLD  = 5'd15,
+        ST_STANDBY_RD_ISSUE   = 5'd16,
+        ST_STANDBY_RD_WAIT    = 5'd17,
+        ST_STREAM_RD_ISSUE    = 5'd18,
+        ST_STREAM_RD_WAIT     = 5'd19;
+
+    reg [4:0] state;
+    reg [DELAY_W-1:0] delay_count;
+    reg [7:0] rom_index;
+
+    reg        cmd_valid;
+    wire       cmd_ready;
+    reg        cmd_read;
+    reg [15:0] cmd_reg;
+    reg [7:0]  cmd_wdata;
+    wire [7:0] cmd_rdata;
+    wire       master_busy;
+    wire       master_done;
+    wire       master_ack_error;
+
+    wire [23:0] rom_word;
+    assign rom_word = rom_lookup(rom_index);
+
+    i2c_reg16_master #(
+        .CLK_HZ(CLK_HZ),
+        .I2C_HZ(I2C_HZ),
+        .DEVICE_ADDR(7'h10)
+    ) u_i2c (
+        .clk(clk),
+        .rst_n(rst_n),
+        .cmd_valid(cmd_valid),
+        .cmd_ready(cmd_ready),
+        .cmd_read(cmd_read),
+        .cmd_reg(cmd_reg),
+        .cmd_wdata(cmd_wdata),
+        .cmd_rdata(cmd_rdata),
+        .busy(master_busy),
+        .done(master_done),
+        .ack_error(master_ack_error),
+        .scl(cam_scl),
+        .sda(cam_sda)
+    );
+
+    // {register address, one data byte}.  Sixteen-bit sensor values are
+    // represented by two consecutive byte writes, high byte first.
+    function [23:0] rom_lookup;
+        input [7:0] index;
+        begin
+            case (index)
+                8'd0:  rom_lookup = {16'h0100, 8'h00};
+                8'd1:  rom_lookup = {16'h30eb, 8'h05};
+                8'd2:  rom_lookup = {16'h30eb, 8'h0c};
+                8'd3:  rom_lookup = {16'h300a, 8'hff};
+                8'd4:  rom_lookup = {16'h300b, 8'hff};
+                8'd5:  rom_lookup = {16'h30eb, 8'h05};
+                8'd6:  rom_lookup = {16'h30eb, 8'h09};
+                8'd7:  rom_lookup = {16'h455e, 8'h00};
+                8'd8:  rom_lookup = {16'h471e, 8'h4b};
+                8'd9:  rom_lookup = {16'h4767, 8'h0f};
+                8'd10: rom_lookup = {16'h4750, 8'h14};
+                8'd11: rom_lookup = {16'h4540, 8'h00};
+                8'd12: rom_lookup = {16'h47b4, 8'h14};
+                8'd13: rom_lookup = {16'h4713, 8'h30};
+                8'd14: rom_lookup = {16'h478b, 8'h10};
+                8'd15: rom_lookup = {16'h478f, 8'h10};
+                8'd16: rom_lookup = {16'h4793, 8'h10};
+                8'd17: rom_lookup = {16'h4797, 8'h0e};
+                8'd18: rom_lookup = {16'h479b, 8'h0e};
+                8'd19: rom_lookup = {16'h0170, 8'h01};
+                8'd20: rom_lookup = {16'h0171, 8'h01};
+                8'd21: rom_lookup = {16'h0128, 8'h00};
+                8'd22: rom_lookup = {16'h012a, 8'h18};
+                8'd23: rom_lookup = {16'h012b, 8'h00};
+
+                // Two-lane PLL: 456 MHz link frequency, 182.4 Mpixel/s.
+                8'd24: rom_lookup = {16'h0301, 8'h05};
+                8'd25: rom_lookup = {16'h0303, 8'h01};
+                8'd26: rom_lookup = {16'h0304, 8'h03};
+                8'd27: rom_lookup = {16'h0305, 8'h03};
+                8'd28: rom_lookup = {16'h0306, 8'h00};
+                8'd29: rom_lookup = {16'h0307, 8'h39};
+                8'd30: rom_lookup = {16'h030b, 8'h01};
+                8'd31: rom_lookup = {16'h030c, 8'h00};
+                8'd32: rom_lookup = {16'h030d, 8'h72};
+                8'd33: rom_lookup = {16'h0114, 8'h01};
+
+                // Centre crop: native 3296x2480 -> crop 1280x960.
+                // Sensor register coordinates subtract the 8-pixel active
+                // area offset: X 1000..2279, Y 752..1711.
+                8'd34: rom_lookup = {16'h0164, 8'h03};
+                8'd35: rom_lookup = {16'h0165, 8'he8};
+                8'd36: rom_lookup = {16'h0166, 8'h08};
+                8'd37: rom_lookup = {16'h0167, 8'he7};
+                8'd38: rom_lookup = {16'h0168, 8'h02};
+                8'd39: rom_lookup = {16'h0169, 8'hf0};
+                8'd40: rom_lookup = {16'h016a, 8'h06};
+                8'd41: rom_lookup = {16'h016b, 8'haf};
+                8'd42: rom_lookup = {16'h0174, 8'h03};
+                8'd43: rom_lookup = {16'h0175, 8'h03};
+                8'd44: rom_lookup = {16'h016c, 8'h02};
+                8'd45: rom_lookup = {16'h016d, 8'h80};
+                8'd46: rom_lookup = {16'h016e, 8'h01};
+                8'd47: rom_lookup = {16'h016f, 8'he0};
+                8'd48: rom_lookup = {16'h0624, 8'h02};
+                8'd49: rom_lookup = {16'h0625, 8'h80};
+                8'd50: rom_lookup = {16'h0626, 8'h01};
+                8'd51: rom_lookup = {16'h0627, 8'he0};
+                8'd52: rom_lookup = {16'h018c, 8'h0a};
+                8'd53: rom_lookup = {16'h018d, 8'h0a};
+                8'd54: rom_lookup = {16'h0309, 8'h0a};
+
+                // Initial exposure/gain and timing for 640x480 binned mode.
+                8'd55: rom_lookup = {16'h0157, 8'h00};
+                8'd56: rom_lookup = {16'h0158, 8'h01};
+                8'd57: rom_lookup = {16'h0159, 8'h00};
+                8'd58: rom_lookup = {16'h015a, 8'h03};
+                8'd59: rom_lookup = {16'h015b, 8'h20};
+                8'd60: rom_lookup = {16'h0160, 8'h03};
+                8'd61: rom_lookup = {16'h0161, 8'h55};
+                8'd62: rom_lookup = {16'h0162, 8'h0d};
+                8'd63: rom_lookup = {16'h0163, 8'he8};
+                8'd64: rom_lookup = {16'h0172, 8'h00};
+                8'd65: rom_lookup = {16'h0600, 8'h00};
+                8'd66: rom_lookup = {16'h0601,
+                                     (ENABLE_TEST_PATTERN != 0) ? 8'h02 : 8'h00};
+                8'd67: rom_lookup = {16'h0100, 8'h01};
+                default: rom_lookup = {16'h0100, 8'h00};
+            endcase
+        end
+    endfunction
+
+    always @(*) begin
+        debug_state = {3'd0, state};
+        debug_index = rom_index;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= ST_POWER_OFF;
+            delay_count <= {DELAY_W{1'b0}};
+            rom_index   <= 8'd0;
+            cmd_valid   <= 1'b0;
+            cmd_read    <= 1'b0;
+            cmd_reg     <= 16'd0;
+            cmd_wdata   <= 8'd0;
+            cam_enable  <= 1'b0;
+            init_busy   <= 1'b1;
+            init_done   <= 1'b0;
+            init_error  <= 1'b0;
+            chip_id     <= 16'd0;
+        end else begin
+            cmd_valid <= 1'b0;
+
+            if (restart) begin
+                state       <= ST_POWER_OFF;
+                delay_count <= {DELAY_W{1'b0}};
+                rom_index   <= 8'd0;
+                cam_enable  <= 1'b0;
+                init_busy   <= 1'b1;
+                init_done   <= 1'b0;
+                init_error  <= 1'b0;
+                chip_id     <= 16'd0;
+            end else begin
+                case (state)
+                    ST_POWER_OFF: begin
+                        cam_enable <= 1'b0;
+                        init_busy  <= 1'b1;
+                        if (delay_count == OFF_CYCLES - 1) begin
+                            delay_count <= {DELAY_W{1'b0}};
+                            cam_enable  <= 1'b1;
+                            state       <= ST_POWER_ON;
+                        end else begin
+                            delay_count <= delay_count + 1'b1;
+                        end
+                    end
+
+                    ST_POWER_ON: begin
+                        if (delay_count == ON_CYCLES - 1) begin
+                            delay_count <= {DELAY_W{1'b0}};
+                            state <= ST_ID0_ISSUE;
+                        end else begin
+                            delay_count <= delay_count + 1'b1;
+                        end
+                    end
+
+                    ST_ID0_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b1;
+                            cmd_reg   <= 16'h0000;
+                            cmd_wdata <= 8'h00;
+                            cmd_valid <= 1'b1;
+                            state     <= ST_ID0_WAIT;
+                        end
+                    end
+
+                    ST_ID0_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error || (cmd_rdata != 8'h02)) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                chip_id[15:8] <= cmd_rdata;
+                                state <= ST_ID1_ISSUE;
+                            end
+                        end
+                    end
+
+                    ST_ID1_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b1;
+                            cmd_reg   <= 16'h0001;
+                            cmd_wdata <= 8'h00;
+                            cmd_valid <= 1'b1;
+                            state     <= ST_ID1_WAIT;
+                        end
+                    end
+
+                    ST_ID1_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error || (cmd_rdata != 8'h19)) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                chip_id[7:0] <= cmd_rdata;
+                                rom_index <= 8'd0;
+                                state <= ST_LP11_STREAM_ISSUE;
+                            end
+                        end
+                    end
+
+                    ST_LP11_STREAM_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b0;
+                            cmd_reg   <= 16'h0100;
+                            cmd_wdata <= 8'h01;
+                            cmd_valid <= 1'b1;
+                            state     <= ST_LP11_STREAM_WAIT;
+                        end
+                    end
+
+                    ST_LP11_STREAM_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                delay_count <= {DELAY_W{1'b0}};
+                                state <= ST_LP11_STREAM_HOLD;
+                            end
+                        end
+                    end
+
+                    ST_LP11_STREAM_HOLD: begin
+                        if (delay_count == LP11_CYCLES - 1) begin
+                            delay_count <= {DELAY_W{1'b0}};
+                            state <= ST_LP11_STANDBY_ISSUE;
+                        end else begin
+                            delay_count <= delay_count + 1'b1;
+                        end
+                    end
+
+                    ST_LP11_STANDBY_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b0;
+                            cmd_reg   <= 16'h0100;
+                            cmd_wdata <= 8'h00;
+                            cmd_valid <= 1'b1;
+                            state     <= ST_LP11_STANDBY_WAIT;
+                        end
+                    end
+
+                    ST_LP11_STANDBY_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                delay_count <= {DELAY_W{1'b0}};
+                                state <= ST_LP11_STANDBY_HOLD;
+                            end
+                        end
+                    end
+
+                    ST_LP11_STANDBY_HOLD: begin
+                        if (delay_count == LP11_CYCLES - 1) begin
+                            delay_count <= {DELAY_W{1'b0}};
+                            state <= ST_STANDBY_RD_ISSUE;
+                        end else begin
+                            delay_count <= delay_count + 1'b1;
+                        end
+                    end
+
+                    ST_STANDBY_RD_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b1;
+                            cmd_reg   <= 16'h0100;
+                            cmd_wdata <= 8'h00;
+                            cmd_valid <= 1'b1;
+                            state     <= ST_STANDBY_RD_WAIT;
+                        end
+                    end
+
+                    ST_STANDBY_RD_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error || (cmd_rdata != 8'h00)) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                rom_index <= 8'd0;
+                                state <= ST_WR_ISSUE;
+                            end
+                        end
+                    end
+
+                    ST_WR_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b0;
+                            cmd_reg   <= rom_word[23:8];
+                            cmd_wdata <= rom_word[7:0];
+                            cmd_valid <= 1'b1;
+                            state     <= ST_WR_WAIT;
+                        end
+                    end
+
+                    ST_WR_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error) begin
+                                state <= ST_ERROR;
+                            end else if (rom_index == ROM_LAST) begin
+                                state <= ST_STREAM_RD_ISSUE;
+                            end else begin
+                                rom_index <= rom_index + 1'b1;
+                                state <= ST_WR_ISSUE;
+                            end
+                        end
+                    end
+
+                    ST_STREAM_RD_ISSUE: begin
+                        if (cmd_ready) begin
+                            cmd_read  <= 1'b1;
+                            cmd_reg   <= 16'h0100;
+                            cmd_wdata <= 8'h00;
+                            cmd_valid <= 1'b1;
+                            state     <= ST_STREAM_RD_WAIT;
+                        end
+                    end
+
+                    ST_STREAM_RD_WAIT: begin
+                        if (master_done) begin
+                            if (master_ack_error || (cmd_rdata != 8'h01)) begin
+                                state <= ST_ERROR;
+                            end else begin
+                                state <= ST_DONE;
+                            end
+                        end
+                    end
+
+                    ST_DONE: begin
+                        init_busy <= 1'b0;
+                        init_done <= 1'b1;
+                    end
+
+                    ST_ERROR: begin
+                        init_busy  <= 1'b0;
+                        init_done  <= 1'b0;
+                        init_error <= 1'b1;
+                    end
+
+                    default: state <= ST_ERROR;
+                endcase
+            end
+        end
+    end
+
+endmodule

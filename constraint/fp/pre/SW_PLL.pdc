@@ -1,0 +1,28 @@
+# Microchip Physical design constraints file
+
+# Version: 2025.2 2025.2.0.14
+
+# Design Name: MPFS_DISCOVERY_KIT 
+
+# Input Netlist Format: EDIF 
+
+# Family: PolarFireSoC , Die: MPFS095T , Package: FCSG325 , Speed grade: -1 
+
+# Date generated: Mon Oct 12 12:02:29 2026 
+
+
+#
+# Local clock constraints
+#
+
+
+#
+# Region constraints
+#
+
+
+#
+# Core cell constraints
+#
+
+set_location -inst_name CLOCKS_AND_RESETS_0/CCC_FIC_x_CLK/PF_CCC_C0_0/pll_inst_0 -fixed true -x 0 -y 8

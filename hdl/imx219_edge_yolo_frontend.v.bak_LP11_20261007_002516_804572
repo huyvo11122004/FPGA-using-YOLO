@@ -1,0 +1,597 @@
+`timescale 1ns/1ps
+
+// IMX219 RAW10 -> Gaussian -> Sobel -> binary refine -> 320x240 edge buffer
+// -> 256x192 resize -> 32-line top/bottom letterbox -> 3-plane CHW DDR.
+//
+// IMPORTANT: MIPI D-PHY and CSI-2 packet decoding are vendor IP and are not
+// recreated in this file.  Connect the native RAW10 outputs of Microchip's
+// MIPI CSI-2 Receiver Decoder to the mipi_* inputs below.
+module imx219_edge_yolo_frontend #(
+    parameter integer ADDR_W = 32,
+    parameter [ADDR_W-1:0] INPUT_BASE = {ADDR_W{1'b0}},
+    parameter integer SYS_CLK_HZ = 54_347_826,
+    parameter [10:0] SOBEL_THRESHOLD = 11'd160,
+    parameter integer PRE_GAUSSIAN_ENABLE = 1,
+    parameter integer EDGE_REFINE_ENABLE = 1,
+    parameter integer EDGE_KEEP_MIN = 2,
+    parameter integer EDGE_FILL_MIN = 4,
+    parameter integer ENABLE_TEST_PATTERN = 1,
+    parameter [7:0] EDGE_ON_VALUE = 8'd127
+) (
+    input  wire                 clk,
+    input  wire                 rst_n,
+    input  wire                 clear,
+    input  wire                 accept_enable,
+
+    // Native output from the generated Microchip CSI-2 receiver.
+    input  wire                 mipi_pixel_clk,
+    input  wire [9:0]           mipi_raw10,
+    input  wire                 mipi_line_valid,
+    input  wire                 mipi_line_start,
+    input  wire                 mipi_line_end,
+    input  wire                 mipi_frame_valid,
+    input  wire                 mipi_ecc_error,
+    input  wire                 mipi_crc_error,
+
+    // Camera control pins on J11.
+    output wire                 cam_enable,
+    output wire                 cam_gpio1,
+    inout  wire                 cam_i2c_scl,
+    inout  wire                 cam_i2c_sda,
+
+    output wire                 mem_wr_req,
+    output wire [ADDR_W-1:0]    mem_wr_addr,
+    output wire [7:0]           mem_wr_data,
+    input  wire                 mem_wr_ready,
+
+    output wire                 frame_done_pulse,
+    output wire                 frame_loaded,
+    output wire                 busy,
+    output wire                 error,
+    output wire                 overrun_error,
+    output wire [31:0]          payload_count,
+    output wire [31:0]          frames_loaded_count,
+    output wire [7:0]           debug_state,
+
+    output wire                 cam_init_done,
+    output wire                 cam_init_busy,
+    output wire                 cam_init_error,
+    output wire [15:0]          cam_chip_id,
+    output wire [31:0]          cam_frame_count,
+    output wire [31:0]          cam_pixel_count,
+    output wire                 cam_size_error,
+    output wire                 cam_ecc_error,
+    output wire                 cam_crc_error
+);
+
+    wire [7:0] init_debug_state;
+    wire [7:0] init_debug_index;
+
+    imx219_init_640x480 #(
+        .CLK_HZ(SYS_CLK_HZ),
+        .I2C_HZ(100_000),
+        .ENABLE_TEST_PATTERN(ENABLE_TEST_PATTERN)
+    ) u_init (
+        .clk(clk),
+        .rst_n(rst_n),
+        // Frame clear must not power-cycle/reconfigure the sensor every frame.
+        // A full camera restart is obtained by asserting rst_n/soft reset.
+        .restart(1'b0),
+        .cam_enable(cam_enable),
+        .cam_gpio1(cam_gpio1),
+        .cam_scl(cam_i2c_scl),
+        .cam_sda(cam_i2c_sda),
+        .init_busy(cam_init_busy),
+        .init_done(cam_init_done),
+        .init_error(cam_init_error),
+        .chip_id(cam_chip_id),
+        .debug_state(init_debug_state),
+        .debug_index(init_debug_index)
+    );
+
+    wire [7:0] gray_pixel;
+    wire gray_valid;
+    wire raster_frame_start;
+    wire raster_line_start;
+    wire [11:0] raster_x;
+    wire [11:0] raster_y;
+    wire raster_size_error;
+
+    // LP11_FRAME_GUARD: the temporary power-up stream must not be counted
+    // as a 640x480 frame or latch startup ECC/CRC errors into the frontend.
+    // Synchronize initialization completion into the native pixel domain,
+    // then wait for frame blanking before accepting the next complete frame.
+    (* syn_async_reg = 1 *) reg init_done_p1, init_done_p2;
+    reg frame_monitor_armed;
+    always @(posedge mipi_pixel_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            init_done_p1 <= 1'b0;
+            init_done_p2 <= 1'b0;
+            frame_monitor_armed <= 1'b0;
+        end else begin
+            init_done_p1 <= cam_init_done;
+            init_done_p2 <= init_done_p1;
+            if (!init_done_p2)
+                frame_monitor_armed <= 1'b0;
+            else if (!mipi_frame_valid)
+                frame_monitor_armed <= 1'b1;
+        end
+    end
+    wire raster_rst_n = rst_n && frame_monitor_armed;
+
+    mipi_raw10_raster #(
+        .ACTIVE_W(640),
+        .ACTIVE_H(480)
+    ) u_raster (
+        .pixel_clk(mipi_pixel_clk),
+        .rst_n(raster_rst_n),
+        .raw10_in(mipi_raw10),
+        .line_valid_in(mipi_line_valid),
+        .line_start_in(mipi_line_start),
+        .line_end_in(mipi_line_end),
+        .frame_valid_in(mipi_frame_valid),
+        .gray8_out(gray_pixel),
+        .pixel_valid_out(gray_valid),
+        .frame_start_out(raster_frame_start),
+        .line_start_out(raster_line_start),
+        .x_out(raster_x),
+        .y_out(raster_y),
+        .frame_count(cam_frame_count),
+        .pixel_count(cam_pixel_count),
+        .size_error(raster_size_error)
+    );
+
+    wire writer_busy;
+    wire writer_frame_loaded;
+    wire capture_enable_sys = accept_enable && cam_init_done &&
+                              !writer_busy && !writer_frame_loaded && !clear;
+
+    reg capture_en_p1, capture_en_p2;
+    always @(posedge mipi_pixel_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            capture_en_p1 <= 1'b0;
+            capture_en_p2 <= 1'b0;
+        end else begin
+            capture_en_p1 <= capture_enable_sys;
+            capture_en_p2 <= capture_en_p1;
+        end
+    end
+
+    wire gray_valid_enabled = gray_valid && capture_en_p2;
+
+    // Optional 3x3 Gaussian smoothing.
+    wire [7:0] g00, g01, g02, g10, g11, g12, g20, g21, g22;
+    wire g_window_valid;
+    wire [11:0] g_x, g_y;
+
+    line_buffer_3x3 #(
+        .PIXEL_WIDTH(8), .IMG_WIDTH(640), .X_WIDTH(12), .Y_WIDTH(12)
+    ) u_lb_gaussian (
+        .clk(mipi_pixel_clk), .rst_n(rst_n),
+        .pixel_in(gray_pixel), .pixel_valid(gray_valid_enabled),
+        .x_in(raster_x), .y_in(raster_y),
+        .p00(g00), .p01(g01), .p02(g02),
+        .p10(g10), .p11(g11), .p12(g12),
+        .p20(g20), .p21(g21), .p22(g22),
+        .window_valid(g_window_valid), .x_out(g_x), .y_out(g_y)
+    );
+
+    wire smooth_valid;
+    wire [7:0] smooth_pixel;
+    wire [11:0] smooth_x, smooth_y;
+
+    gaussian_smooth_3x3 #(
+        .PIXEL_WIDTH(8), .X_WIDTH(12), .Y_WIDTH(12)
+    ) u_gaussian (
+        .clk(mipi_pixel_clk), .rst_n(rst_n),
+        .window_valid(g_window_valid),
+        .w00(g00), .w01(g01), .w02(g02),
+        .w10(g10), .w11(g11), .w12(g12),
+        .w20(g20), .w21(g21), .w22(g22),
+        .x_in(g_x), .y_in(g_y),
+        .smooth_valid(smooth_valid), .smooth_pixel(smooth_pixel),
+        .x_out(smooth_x), .y_out(smooth_y)
+    );
+
+    wire pre_valid = (PRE_GAUSSIAN_ENABLE != 0) ? smooth_valid : gray_valid_enabled;
+    wire [7:0] pre_pixel = (PRE_GAUSSIAN_ENABLE != 0) ? smooth_pixel : gray_pixel;
+    wire [11:0] pre_x = (PRE_GAUSSIAN_ENABLE != 0) ? smooth_x : raster_x;
+    wire [11:0] pre_y = (PRE_GAUSSIAN_ENABLE != 0) ? smooth_y : raster_y;
+
+    wire [7:0] s00, s01, s02, s10, s11, s12, s20, s21, s22;
+    wire s_window_valid;
+    wire [11:0] s_x, s_y;
+
+    line_buffer_3x3 #(
+        .PIXEL_WIDTH(8), .IMG_WIDTH(640), .X_WIDTH(12), .Y_WIDTH(12)
+    ) u_lb_sobel (
+        .clk(mipi_pixel_clk), .rst_n(rst_n),
+        .pixel_in(pre_pixel), .pixel_valid(pre_valid),
+        .x_in(pre_x), .y_in(pre_y),
+        .p00(s00), .p01(s01), .p02(s02),
+        .p10(s10), .p11(s11), .p12(s12),
+        .p20(s20), .p21(s21), .p22(s22),
+        .window_valid(s_window_valid), .x_out(s_x), .y_out(s_y)
+    );
+
+    wire sobel_valid;
+    wire [10:0] sobel_mag;
+    sobel_core_fix u_sobel (
+        .clk(mipi_pixel_clk), .rst_n(rst_n),
+        .window_valid(s_window_valid),
+        .w00(s00), .w01(s01), .w02(s02),
+        .w10(s10), .w11(s11), .w12(s12),
+        .w20(s20), .w21(s21), .w22(s22),
+        .grad_valid(sobel_valid), .grad_mag(sobel_mag)
+    );
+
+    reg [11:0] sx1, sx2, sx3, sy1, sy2, sy3;
+    always @(posedge mipi_pixel_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sx1 <= 0; sx2 <= 0; sx3 <= 0;
+            sy1 <= 0; sy2 <= 0; sy3 <= 0;
+        end else begin
+            sx1 <= s_x; sx2 <= sx1; sx3 <= sx2;
+            sy1 <= s_y; sy2 <= sy1; sy3 <= sy2;
+        end
+    end
+
+    wire edge_raw = (sobel_mag >= SOBEL_THRESHOLD);
+
+    wire [0:0] e00, e01, e02, e10, e11, e12, e20, e21, e22;
+    wire e_window_valid;
+    wire [11:0] e_x, e_y;
+    line_buffer_3x3 #(
+        .PIXEL_WIDTH(1), .IMG_WIDTH(640), .X_WIDTH(12), .Y_WIDTH(12)
+    ) u_lb_refine (
+        .clk(mipi_pixel_clk), .rst_n(rst_n),
+        .pixel_in(edge_raw), .pixel_valid(sobel_valid),
+        .x_in(sx3), .y_in(sy3),
+        .p00(e00), .p01(e01), .p02(e02),
+        .p10(e10), .p11(e11), .p12(e12),
+        .p20(e20), .p21(e21), .p22(e22),
+        .window_valid(e_window_valid), .x_out(e_x), .y_out(e_y)
+    );
+
+    wire refined_valid, refined_bit;
+    wire [11:0] refined_x, refined_y;
+    edge_refine_3x3 #(
+        .X_WIDTH(12), .Y_WIDTH(12),
+        .KEEP_MIN(EDGE_KEEP_MIN), .FILL_MIN(EDGE_FILL_MIN)
+    ) u_refine (
+        .clk(mipi_pixel_clk), .rst_n(rst_n),
+        .window_valid(e_window_valid),
+        .p00(e00[0]), .p01(e01[0]), .p02(e02[0]),
+        .p10(e10[0]), .p11(e11[0]), .p12(e12[0]),
+        .p20(e20[0]), .p21(e21[0]), .p22(e22[0]),
+        .x_in(e_x), .y_in(e_y),
+        .edge_valid(refined_valid), .edge_out(refined_bit),
+        .x_out(refined_x), .y_out(refined_y)
+    );
+
+    wire final_valid = (EDGE_REFINE_ENABLE != 0) ? refined_valid : sobel_valid;
+    wire final_bit   = (EDGE_REFINE_ENABLE != 0) ? refined_bit : edge_raw;
+    wire [11:0] final_x = (EDGE_REFINE_ENABLE != 0) ? refined_x : sx3;
+    wire [11:0] final_y = (EDGE_REFINE_ENABLE != 0) ? refined_y : sy3;
+
+    wire [16:0] edge_rd_addr;
+    wire edge_rd_data;
+    wire frame_ready_pulse;
+    wire consume_toggle;
+    wire capture_busy_pixel;
+
+    edge_frame_buffer_320x240 u_frame_buffer (
+        .wr_clk(mipi_pixel_clk), .wr_rst_n(rst_n),
+        .capture_enable_async(capture_enable_sys),
+        .frame_start(raster_frame_start),
+        .x(final_x), .y(final_y),
+        .pixel_in(final_bit), .pixel_valid(final_valid),
+        .capture_busy(capture_busy_pixel),
+        .consume_toggle_async(consume_toggle),
+        .rd_clk(clk), .rd_rst_n(rst_n),
+        .rd_addr(edge_rd_addr), .rd_data(edge_rd_data),
+        .frame_ready_pulse(frame_ready_pulse)
+    );
+
+    wire writer_error;
+    edge_320x240_to_chw_ddr #(
+        .ADDR_W(ADDR_W), .INPUT_BASE(INPUT_BASE),
+        .EDGE_ON_VALUE(EDGE_ON_VALUE)
+    ) u_writer (
+        .clk(clk), .rst_n(rst_n), .clear(clear),
+        .frame_ready_pulse(frame_ready_pulse),
+        .edge_rd_addr(edge_rd_addr), .edge_rd_data(edge_rd_data),
+        .consume_toggle(consume_toggle),
+        .mem_wr_req(mem_wr_req), .mem_wr_addr(mem_wr_addr),
+        .mem_wr_data(mem_wr_data), .mem_wr_ready(mem_wr_ready),
+        .frame_done_pulse(frame_done_pulse),
+        .frame_loaded(writer_frame_loaded),
+        .busy(writer_busy), .error(writer_error),
+        .overrun_error(overrun_error),
+        .payload_count(payload_count),
+        .frames_loaded_count(frames_loaded_count),
+        .debug_state(debug_state)
+    );
+
+    reg cap_busy_s1, cap_busy_s2;
+    reg size_err_s1, size_err_s2;
+    reg ecc_err_pixel, crc_err_pixel;
+    reg ecc_err_s1, ecc_err_s2;
+    reg crc_err_s1, crc_err_s2;
+
+    always @(posedge mipi_pixel_clk or negedge raster_rst_n) begin
+        if (!raster_rst_n) begin
+            ecc_err_pixel <= 1'b0;
+            crc_err_pixel <= 1'b0;
+        end else begin
+            if (mipi_ecc_error) ecc_err_pixel <= 1'b1;
+            if (mipi_crc_error) crc_err_pixel <= 1'b1;
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            cap_busy_s1 <= 1'b0; cap_busy_s2 <= 1'b0;
+            size_err_s1 <= 1'b0; size_err_s2 <= 1'b0;
+            ecc_err_s1  <= 1'b0; ecc_err_s2  <= 1'b0;
+            crc_err_s1  <= 1'b0; crc_err_s2  <= 1'b0;
+        end else begin
+            cap_busy_s1 <= capture_busy_pixel;
+            cap_busy_s2 <= cap_busy_s1;
+            size_err_s1 <= raster_size_error;
+            size_err_s2 <= size_err_s1;
+            ecc_err_s1  <= ecc_err_pixel;
+            ecc_err_s2  <= ecc_err_s1;
+            crc_err_s1  <= crc_err_pixel;
+            crc_err_s2  <= crc_err_s1;
+        end
+    end
+
+    assign frame_loaded  = writer_frame_loaded;
+    assign busy          = writer_busy | cap_busy_s2 | cam_init_busy;
+    assign error         = writer_error | cam_init_error | size_err_s2 |
+                           ecc_err_s2 | crc_err_s2;
+    assign cam_size_error = size_err_s2;
+    assign cam_ecc_error  = ecc_err_s2;
+    assign cam_crc_error  = crc_err_s2;
+
+endmodule
+
+
+// Stores one downsampled 320x240 binary edge frame.  A pixel is selected from
+// every 2x2 block after Sobel; the memory cost is 76,800 bits.
+module edge_frame_buffer_320x240 (
+    input  wire        wr_clk,
+    input  wire        wr_rst_n,
+    input  wire        capture_enable_async,
+    input  wire        frame_start,
+    input  wire [11:0] x,
+    input  wire [11:0] y,
+    input  wire        pixel_in,
+    input  wire        pixel_valid,
+    output wire        capture_busy,
+    input  wire        consume_toggle_async,
+    input  wire        rd_clk,
+    input  wire        rd_rst_n,
+    input  wire [16:0] rd_addr,
+    output reg         rd_data,
+    output reg         frame_ready_pulse
+);
+    localparam integer TOTAL = 320 * 240;
+
+    (* syn_ramstyle = "lsram, no_rw_check" *) reg frame_mem [0:TOTAL-1];
+    reg capture_active, frame_locked, ready_toggle;
+    reg capture_s1, capture_s2;
+    reg consume_s1, consume_s2, consume_seen;
+
+    wire consume_event = consume_s2 ^ consume_seen;
+    wire sample_hit = pixel_valid && capture_active && !frame_locked &&
+                      (x < 12'd640) && (y < 12'd480) &&
+                      (x[0] == 1'b0) && (y[0] == 1'b0);
+    wire [8:0] sample_x = x[9:1];
+    wire [7:0] sample_y = y[8:1];
+    wire [16:0] sample_addr = ({9'd0, sample_y} << 8) +
+                              ({9'd0, sample_y} << 6) +
+                              {8'd0, sample_x};
+
+    assign capture_busy = capture_active | frame_locked;
+
+    always @(posedge wr_clk or negedge wr_rst_n) begin
+        if (!wr_rst_n) begin
+            capture_active <= 1'b0;
+            frame_locked <= 1'b0;
+            ready_toggle <= 1'b0;
+            capture_s1 <= 1'b0; capture_s2 <= 1'b0;
+            consume_s1 <= 1'b0; consume_s2 <= 1'b0; consume_seen <= 1'b0;
+        end else begin
+            capture_s1 <= capture_enable_async;
+            capture_s2 <= capture_s1;
+            consume_s1 <= consume_toggle_async;
+            consume_s2 <= consume_s1;
+
+            if (consume_event) begin
+                consume_seen <= consume_s2;
+                frame_locked <= 1'b0;
+                capture_active <= 1'b0;
+            end
+
+            // The first frame_start arms capture.  The next frame_start closes
+            // the completed frame after the full vertical blanking interval.
+            // This avoids counting 76,800 writes: 3x3 filters intentionally
+            // omit the outer border, so the number of valid samples is lower.
+            if (frame_start && !frame_locked) begin
+                if (capture_active) begin
+                    ready_toggle <= ~ready_toggle;
+                    frame_locked <= 1'b1;
+                    capture_active <= 1'b0;
+                end else if (capture_s2) begin
+                    capture_active <= 1'b1;
+                end
+            end
+
+            if (sample_hit) begin
+                frame_mem[sample_addr] <= pixel_in;
+            end
+        end
+    end
+
+    reg ready_s1, ready_s2, ready_seen;
+    always @(posedge rd_clk or negedge rd_rst_n) begin
+        if (!rd_rst_n) begin
+            ready_s1 <= 1'b0; ready_s2 <= 1'b0; ready_seen <= 1'b0;
+            frame_ready_pulse <= 1'b0;
+            rd_data <= 1'b0;
+        end else begin
+            ready_s1 <= ready_toggle;
+            ready_s2 <= ready_s1;
+            frame_ready_pulse <= ready_s2 ^ ready_seen;
+            ready_seen <= ready_s2;
+            rd_data <= frame_mem[rd_addr];
+        end
+    end
+endmodule
+
+
+// Reads the 320x240 bit plane and writes three 256x256 CHW planes.
+// Active 320x240 -> nearest-neighbour 256x192, with 32 black rows above and
+// below.  The final payload is exactly 196,608 bytes (0x30000).
+module edge_320x240_to_chw_ddr #(
+    parameter integer ADDR_W = 32,
+    parameter [ADDR_W-1:0] INPUT_BASE = {ADDR_W{1'b0}},
+    parameter [7:0] EDGE_ON_VALUE = 8'd127
+) (
+    input  wire              clk,
+    input  wire              rst_n,
+    input  wire              clear,
+    input  wire              frame_ready_pulse,
+    output reg  [16:0]       edge_rd_addr,
+    input  wire              edge_rd_data,
+    output reg               consume_toggle,
+    output wire              mem_wr_req,
+    output wire [ADDR_W-1:0] mem_wr_addr,
+    output wire [7:0]        mem_wr_data,
+    input  wire              mem_wr_ready,
+    output reg               frame_done_pulse,
+    output reg               frame_loaded,
+    output reg               busy,
+    output reg               error,
+    output wire              overrun_error,
+    output reg [31:0]        payload_count,
+    output reg [31:0]        frames_loaded_count,
+    output wire [7:0]        debug_state
+);
+    localparam [3:0]
+        ST_IDLE=0, ST_PREP=1, ST_RD_ADDR=2, ST_RD_WAIT=3,
+        ST_RD_LATCH=4, ST_WRITE0=5, ST_WRITE1=6, ST_WRITE2=7,
+        ST_NEXT=8, ST_HOLD=9;
+    localparam [ADDR_W-1:0] PLANE_BYTES = 32'd65536;
+
+    reg [3:0] state;
+    reg [15:0] dst_index;
+    reg edge_latched;
+    reg frame_pending;
+    reg buffer_owned;
+
+    wire [7:0] dst_x = dst_index[7:0];
+    wire [7:0] dst_y = dst_index[15:8];
+    wire padding = (dst_y < 8'd32) || (dst_y >= 8'd224);
+    wire [7:0] active_y = dst_y - 8'd32;
+
+    // floor(destination * 5/4): 256x192 -> 320x240.
+    wire [9:0] src_x_mul5 = ({2'd0, dst_x} << 2) + {2'd0, dst_x};
+    wire [9:0] src_y_mul5 = ({2'd0, active_y} << 2) + {2'd0, active_y};
+    wire [8:0] src_x = src_x_mul5[9:2];
+    wire [7:0] src_y = src_y_mul5[9:2];
+    wire [16:0] src_addr_calc = ({9'd0, src_y} << 8) +
+                                 ({9'd0, src_y} << 6) +
+                                 {8'd0, src_x};
+
+    wire write_state = (state == ST_WRITE0) || (state == ST_WRITE1) ||
+                       (state == ST_WRITE2);
+    wire [ADDR_W-1:0] pixel_addr = {{(ADDR_W-16){1'b0}}, dst_index};
+    wire [ADDR_W-1:0] plane_offset =
+        (state == ST_WRITE1) ? PLANE_BYTES :
+        (state == ST_WRITE2) ? (PLANE_BYTES << 1) : {ADDR_W{1'b0}};
+
+    assign mem_wr_req = write_state;
+    assign mem_wr_addr = INPUT_BASE + plane_offset + pixel_addr;
+    assign mem_wr_data = edge_latched ? EDGE_ON_VALUE : 8'd0;
+    assign debug_state = {4'd0, state};
+    assign overrun_error = error;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= ST_IDLE; dst_index <= 0; edge_latched <= 0;
+            edge_rd_addr <= 0; consume_toggle <= 0;
+            frame_done_pulse <= 0; frame_loaded <= 0; busy <= 0; error <= 0;
+            payload_count <= 0; frames_loaded_count <= 0;
+            frame_pending <= 0; buffer_owned <= 0;
+        end else begin
+            frame_done_pulse <= 1'b0;
+            if (frame_ready_pulse) begin
+                if (buffer_owned || frame_pending || busy || frame_loaded)
+                    error <= 1'b1;
+                else begin
+                    frame_pending <= 1'b1;
+                    buffer_owned <= 1'b1;
+                end
+            end
+
+            if (clear) begin
+                if (buffer_owned) consume_toggle <= ~consume_toggle;
+                state <= ST_IDLE; dst_index <= 0; edge_latched <= 0;
+                edge_rd_addr <= 0; frame_loaded <= 0; busy <= 0; error <= 0;
+                payload_count <= 0; frames_loaded_count <= 0;
+                frame_pending <= 0; buffer_owned <= 0;
+            end else begin
+                case (state)
+                    ST_IDLE: begin
+                        busy <= 1'b0;
+                        if (frame_pending && !frame_loaded) begin
+                            frame_pending <= 1'b0;
+                            dst_index <= 16'd0;
+                            payload_count <= 32'd0;
+                            busy <= 1'b1;
+                            state <= ST_PREP;
+                        end
+                    end
+                    ST_PREP: begin
+                        // The cascaded 3x3 filters do not generate x=0/y=0.
+                        // Force that source border to black instead of reading
+                        // an unwritten LSRAM location.
+                        if (padding || (src_x == 0) || (src_y == 0)) begin
+                            edge_latched <= 1'b0;
+                            state <= ST_WRITE0;
+                        end
+                        else state <= ST_RD_ADDR;
+                    end
+                    ST_RD_ADDR: begin edge_rd_addr <= src_addr_calc; state <= ST_RD_WAIT; end
+                    ST_RD_WAIT: state <= ST_RD_LATCH;
+                    ST_RD_LATCH: begin edge_latched <= edge_rd_data; state <= ST_WRITE0; end
+                    ST_WRITE0: if (mem_wr_ready) begin payload_count <= payload_count + 1'b1; state <= ST_WRITE1; end
+                    ST_WRITE1: if (mem_wr_ready) begin payload_count <= payload_count + 1'b1; state <= ST_WRITE2; end
+                    ST_WRITE2: if (mem_wr_ready) begin payload_count <= payload_count + 1'b1; state <= ST_NEXT; end
+                    ST_NEXT: begin
+                        if (dst_index == 16'hffff) begin
+                            frame_loaded <= 1'b1;
+                            frame_done_pulse <= 1'b1;
+                            busy <= 1'b0;
+                            payload_count <= 32'd196608;
+                            frames_loaded_count <= frames_loaded_count + 1'b1;
+                            if (buffer_owned) begin
+                                consume_toggle <= ~consume_toggle;
+                                buffer_owned <= 1'b0;
+                            end
+                            state <= ST_HOLD;
+                        end else begin
+                            dst_index <= dst_index + 1'b1;
+                            state <= ST_PREP;
+                        end
+                    end
+                    ST_HOLD: busy <= 1'b0;
+                    default: begin state <= ST_IDLE; busy <= 1'b0; error <= 1'b1; end
+                endcase
+            end
+        end
+    end
+endmodule

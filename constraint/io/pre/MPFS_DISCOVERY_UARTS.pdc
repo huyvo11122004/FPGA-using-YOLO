@@ -1,0 +1,57 @@
+# Microchip I/O Physical Design Constraints file
+
+# User I/O Constraints file 
+
+# Version: 2025.2 2025.2.0.14
+
+# Family: PolarFireSoC , Die: MPFS095T , Package: FCSG325
+
+# Date generated: Mon Oct 12 12:02:29 2026 
+
+
+# 
+# User Locked I/O Bank Settings
+# 
+
+
+# 
+# Unlocked I/O Bank Settings
+# The I/O Bank Settings can be locked by directly editing this file
+# or by making changes in the I/O Attribute Editor
+# 
+
+
+# 
+# User Locked I/O settings
+# 
+
+set_io -port_name FTDI_UART_D_RXD  \
+    -pin_name Y21                  \
+    -fixed true                    \
+    -DIRECTION OUTPUT
+
+
+set_io -port_name FTDI_UART_D_TXD  \
+    -pin_name W21                  \
+    -fixed true                    \
+    -DIRECTION INPUT
+
+
+
+# 
+# Dedicated Peripheral I/O Settings
+# 
+
+
+# 
+# Unlocked I/O settings
+# The I/Os in this section are unplaced or placed but are not locked
+# the other listed attributes have been applied
+# 
+
+
+#
+#Ports using Dedicated Pins
+
+#
+

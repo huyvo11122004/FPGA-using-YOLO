@@ -1,0 +1,11 @@
+Signed-int8 HDL patch notes
+
+Patched files:
+- conv2d_ddr_core.v: feature-map write now does arithmetic right shift then signed-int8 saturation (-128..127), not uint8 clipping 0..255.
+- conv_layer_ddr.v: passes REQUANT_SHIFT to conv2d core.
+- top_yolov5n_ddr.v: adds CONV_OUT_SHIFT parameter, default 10. Try 9/10/11 on kit by changing this parameter before synthesis.
+- shared_add_ddr_engine.v: residual ADD now signed-int8 saturating add, not uint8 saturating add.
+- shared_maxpool5x5_ddr_engine.v and maxpool5x5_ddr_core.v: maxpool now compares signed-int8 and initializes to -128.
+
+Important:
+This fixes the biggest signedness/range bug, but it is still not a full YOLOv5 quantized inference implementation. A correct model still needs per-layer requant scales/zero-points and SiLU/activation handling. Use this patch to make early feature maps debuggable, then compare L0/L1 dumps against a Python reference.

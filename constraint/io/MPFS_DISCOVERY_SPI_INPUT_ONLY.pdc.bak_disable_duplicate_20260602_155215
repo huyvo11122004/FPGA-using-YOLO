@@ -1,0 +1,22 @@
+# FT232H SPI input to YOLO via Raspberry Pi J10 GPIO pins
+# J10 pin 29 = FPGA D17 = SPI_MOSI
+# J10 pin 31 = FPGA D18 = SPI_SCK
+# J10 pin 33 = FPGA A15 = SPI_CS_N
+
+set_io -port_name SPI_MOSI \
+    -pin_name D17 \
+    -fixed true \
+    -io_std LVCMOS33 \
+    -DIRECTION INPUT
+
+set_io -port_name SPI_SCK \
+    -pin_name D18 \
+    -fixed true \
+    -io_std LVCMOS33 \
+    -DIRECTION INPUT
+
+set_io -port_name SPI_CS_N \
+    -pin_name A15 \
+    -fixed true \
+    -io_std LVCMOS33 \
+    -DIRECTION INPUT
