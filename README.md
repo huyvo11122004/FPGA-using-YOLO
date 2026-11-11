@@ -124,6 +124,9 @@ Work includes OV7670 capture debugging, edge-image preprocessing, YOLOv5n traini
 
 **Võ Hoàng Huy** & **Đặng Văn Thịnh** & **Phạm Trần Bảo Long**
 
+## Instructor
+**TS. Vũ Vân Thanh**
+
 Electronics and Telecommunications student  
 GitHub: [@huyvo11122004](https://github.com/huyvo11122004)
 
